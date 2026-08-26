@@ -1,0 +1,242 @@
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
+import androidx.core.app.NotificationCompat
+
+class NotificationHelper(private val context: Context) {
+    private val channelId = "sofar_connection_channel"
+    private val notificationManager = 
+        context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+    init {
+        createNotificationChannel()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Status Połączenia Falownika",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Powiadomienia o utracie łączności z Sofar HYD 5-KTL"
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    fun showConnectionLostNotification() {
+        val notification = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle("Utrata łączności z falownikiem")
+            .setContentText("Brak połączenia lokalnego (Wi-Fi) oraz chmurowego z Sofar HYD.")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+
+        notificationManager.notify(1001, notification)
+    }
+
+    fun clearNotifications() {
+        notificationManager.cancel(1001)
+    }
+}
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
+
+enum class PreferredConnectionMode {
+    AUTO,        // Automatyczny wybór (najpierw lokalnie, potem chmura)
+    FORCE_LOCAL, // Wymuszony tryb Wi-Fi (Lokalnie Modbus TCP)
+    FORCE_CLOUD  // Wymuszony tryb poza siecią Wi-Fi (Chmura API)
+}
+
+enum class ConnectionSource { LOCAL, CLOUD, DISCONNECTED }
+
+class HybridInverterRepository(
+    private val localModbusManager: SofarInverterManager,
+    private val cloudApiService: SolarmanApiService,
+    private val notificationHelper: NotificationHelper,
+    private val localIp: String,
+    private val port: Int = 502
+) {
+    private var accessToken: String? = null
+    var currentPreferredMode: PreferredConnectionMode = PreferredConnectionMode.AUTO
+
+    private suspend fun isLocalAvailable(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(localIp, port), 1500)
+                true
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    suspend fun getInverterData(): Result<InverterDataState> {
+        return when (currentPreferredMode) {
+            PreferredConnectionMode.AUTO -> {
+                if (isLocalAvailable()) fetchLocalData() else fetchCloudData()
+            }
+            PreferredConnectionMode.FORCE_LOCAL -> {
+                if (isLocalAvailable()) fetchLocalData() else handleConnectionLost()
+            }
+            PreferredConnectionMode.FORCE_CLOUD -> {
+                fetchCloudData()
+            }
+        }
+    }
+
+    private suspend fun fetchLocalData(): Result<InverterDataState> {
+        return try {
+            val data = localModbusManager.fetchInverterData()
+            notificationHelper.clearNotifications()
+            Result.success(InverterDataState(data.soc, data.batteryPower, ConnectionSource.LOCAL))
+        } catch (e: Exception) {
+            if (currentPreferredMode == PreferredConnectionMode.AUTO) fetchCloudData() else handleConnectionLost()
+        }
+    }
+
+    private suspend fun fetchCloudData(): Result<InverterDataState> {
+        return try {
+            ensureCloudToken()
+            val response = cloudApiService.getInverterData(
+                bearerToken = "Bearer $accessToken",
+                request = DeviceDataRequest(deviceSn = "SOFAR_SERIAL_NUMBER")
+            )
+            val body = response.body()
+            if (response.isSuccessful && body != null) {
+                notificationHelper.clearNotifications()
+                Result.success(InverterDataState(body.soc, body.batteryPower, ConnectionSource.CLOUD))
+            } else {
+                handleConnectionLost()
+            }
+        } catch (e: Exception) {
+            handleConnectionLost()
+        }
+    }
+
+    private fun handleConnectionLost(): Result<InverterDataState> {
+        notificationHelper.showConnectionLostNotification()
+        return Result.failure(Exception("Brak łączności z falownikiem."))
+    }
+
+    private suspend fun ensureCloudToken() {
+        if (accessToken == null) {
+            val auth = cloudApiService.getAccessToken(AuthRequest("app_id", "app_secret", "email", "pass"))
+            accessToken = auth.body()?.accessToken
+        }
+    }
+}
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HybridControlScreen(viewModel: InverterViewModel = viewModel()) {
+    val state by viewModel.uiState.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // Nagłówek i Wskaźnik Połączenia
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(text = "Sofar HYD 5-KTL", style = MaterialTheme.typography.titleLarge)
+
+            val (statusColor, statusText) = when (state.activeSource) {
+                ConnectionSource.LOCAL -> Pair(Color(0xFF4CAF50), "Lokalnie (Wi-Fi)")
+                ConnectionSource.CLOUD -> Pair(Color(0xFF2196F3), "Chmura (Cloud)")
+                ConnectionSource.DISCONNECTED -> Pair(Color(0xFFF44336), "Brak połączenia")
+            }
+
+            Surface(
+                color = statusColor.copy(alpha = 0.15f),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(
+                    text = statusText,
+                    color = statusColor,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+        }
+
+        // Panel Wyboru Trybu Połączenia
+        Text(text = "Tryb Połączenia", style = MaterialTheme.typography.titleMedium)
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            SegmentedButton(
+                selected = state.preferredMode == PreferredConnectionMode.AUTO,
+                onClick = { viewModel.setConnectionMode(PreferredConnectionMode.AUTO) },
+                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3)
+            ) {
+                Text("Auto")
+            }
+            SegmentedButton(
+                selected = state.preferredMode == PreferredConnectionMode.FORCE_LOCAL,
+                onClick = { viewModel.setConnectionMode(PreferredConnectionMode.FORCE_LOCAL) },
+                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3)
+            ) {
+                Text("Wi-Fi")
+            }
+            SegmentedButton(
+                selected = state.preferredMode == PreferredConnectionMode.FORCE_CLOUD,
+                onClick = { viewModel.setConnectionMode(PreferredConnectionMode.FORCE_CLOUD) },
+                shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3)
+            ) {
+                Text("Poza Wi-Fi")
+            }
+        }
+
+        // Karta Magazynu Energii
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(text = "Poziom Naładowania Baterii: ${state.soc}%")
+                LinearProgressIndicator(
+                    progress = state.soc / 100f,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                )
+                Text(text = "Moc Ładowania/Rozładowania: ${state.batteryPower} W")
+            }
+        }
+
+        // Kontrola Ładowania Tylko z PV
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "Ładuj TYLKO z PV", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        text = "Blokada poboru energii z sieci do akumulatora",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Switch(
+                    checked = state.isPVOnlyCharging,
+                    onCheckedChange = { viewModel.togglePVOnly(it) }
+                )
+            }
+        }
+    }
+}
